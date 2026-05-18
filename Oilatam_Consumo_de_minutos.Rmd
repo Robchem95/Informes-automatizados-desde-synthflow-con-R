@@ -72,7 +72,7 @@ library(knitr)
 library(kableExtra)
 
 SYNTHFLOW_URL <- "https://api.synthflow.ai/v2/calls"
-SYNTHFLOW_KEY <- "KXWok5YRfHqH00OFh2vxu8Oahi0Jh25e7b4VbLW0iCA"
+SYNTHFLOW_KEY <- "api key"
 
 MODEL_IDS <- c(
   "bb9184fe-2ffa-4e42-b7aa-fafc6a7f92c5",
