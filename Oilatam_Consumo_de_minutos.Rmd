@@ -1,0 +1,539 @@
+---
+title: "\\vspace{-2cm}"
+params:
+  fecha_emision: !r format(Sys.Date(), "%d/%m/%Y")
+
+output:
+  pdf_document: default
+  html_document: default
+
+geometry: "top=0.5cm, bottom=3cm, left=1cm, right=1cm"
+
+header-includes: |
+  \usepackage{tikz}
+  \usepackage{xcolor}
+  \definecolor{vattenazul}{HTML}{4A148C}
+  \usepackage{atbegshi}
+  \usepackage{fancyhdr}
+  \usepackage{graphicx}
+  \usepackage{titling}
+
+  \newcommand{\fechaemision}{`r params$fecha_emision`}
+
+  \AtBeginShipoutAddToBox{%
+    \begin{tikzpicture}[remember picture,overlay]
+      \fill[vattenazul] (current page.north west) rectangle ([yshift=-40pt]current page.north east);
+    \end{tikzpicture}
+  }
+
+  \pretitle{
+    \begin{minipage}[t]{0.6\textwidth}
+      \raggedright
+      \includegraphics[width=8cm]{../Logo/Logo_Xetechs.jpg}
+    \end{minipage}
+    \begin{minipage}[t]{0.4\textwidth}
+      \vspace{-1.8cm}
+      \raggedleft
+      {\LARGE\bfseries Informe VAI\\[0.1cm]
+      \footnotesize
+      Fecha de Emisión: \fechaemision}
+    \end{minipage}\\[1cm]
+  }
+  \posttitle{}
+
+  \fancypagestyle{plain}{
+    \fancyhf{}
+    \renewcommand{\headrulewidth}{0pt}
+    \renewcommand{\footrulewidth}{0.4pt}
+    \renewcommand{\footrule}{\hbox to\headwidth{\color{vattenazul}\leaders\hrule height \footrulewidth\hfill}}
+    \fancyfoot[C]{\textcolor{gray}{\small
+      Tel: +5023094-2670 \quad • \quad
+      Email: info@xetechs.com \quad • \quad
+      www.xetechs.com/
+    }}
+  }
+  \pagestyle{plain}
+---
+
+```{r,echo=FALSE,warning=FALSE,message=FALSE}
+from_date <- "2026-04-01"
+to_date <- "2026-05-01"
+```
+
+```{r,echo=FALSE,warning=FALSE,message=FALSE}
+library(httr)
+library(jsonlite)
+library(dplyr)
+library(purrr)
+library(stringr)
+library(tidyr)
+library(tibble)
+library(knitr)
+library(kableExtra)
+
+SYNTHFLOW_URL <- "https://api.synthflow.ai/v2/calls"
+SYNTHFLOW_KEY <- "KXWok5YRfHqH00OFh2vxu8Oahi0Jh25e7b4VbLW0iCA"
+
+MODEL_IDS <- c(
+  "bb9184fe-2ffa-4e42-b7aa-fafc6a7f92c5",
+  "a896eb65-9e44-4b64-80a7-05caaa3933c7",
+  "1a5677fe-dd82-4420-b2d2-feadbe0315ce",
+  "95293754-e482-47a9-adc2-dfde86032abe"
+)
+
+LIMIT <- 100
+
+`%||%` <- function(x, y) if (is.null(x)) y else x
+
+now_ms <- function() as.numeric(Sys.time()) * 1000
+
+
+parse_to_ms <- function(value, tz = "America/Guatemala") {
+  if (is.null(value)) stop("Fecha es NULL")
+
+  s <- as.character(value)
+
+  s <- s |>
+    str_replace_all("\ufeff", "") |>
+    str_replace_all("\u200b", "") |>
+    str_replace_all("\u00a0", " ") |>
+    str_replace_all("[\r\n\t]", " ") |>
+    str_squish()
+
+  s <- str_replace_all(s, "/", "-")
+
+  fmts <- c("%Y-%m-%d", "%Y-%m-%d %H:%M", "%Y-%m-%d %H:%M:%S")
+
+  parsed <- NA
+
+  for (fmt in fmts) {
+    candidate <- suppressWarnings(as.POSIXct(s, format = fmt, tz = tz))
+    if (!is.na(candidate)) {
+      parsed <- candidate
+      break
+    }
+  }
+
+  if (is.na(parsed)) stop(sprintf("No pude parsear la fecha: %s", dQuote(s)))
+
+  as.numeric(parsed) * 1000
+}
+
+
+normalize_calls <- function(calls) {
+
+  if (is.null(calls)) return(list())
+
+  if (is.list(calls) && length(calls) > 0 && is.list(calls[[1]])) {
+    return(calls)
+  }
+
+  if (is.data.frame(calls)) {
+    return(lapply(seq_len(nrow(calls)), function(i) as.list(calls[i, , drop = FALSE])))
+  }
+
+  if (is.list(calls) && !is.null(names(calls))) {
+
+    lens <- lengths(calls)
+    n <- max(lens, 0L)
+
+    if (n == 0) return(list())
+
+    out <- vector("list", n)
+
+    for (i in seq_len(n)) {
+
+      row <- list()
+
+      for (nm in names(calls)) {
+
+        col <- calls[[nm]]
+
+        row[[nm]] <- if (length(col) >= i) col[[i]] else NA
+
+      }
+
+      out[[i]] <- row
+    }
+
+    return(out)
+
+  }
+
+  list()
+
+}
+
+
+fetch_calls_page <- function(
+  model_id,
+  from_date = NULL,
+  to_date = NULL,
+  limit = LIMIT,
+  timeout_sec = 120,
+  retries = 5,
+  backoff_base = 1.6
+) {
+  if (is.na(SYNTHFLOW_KEY) || SYNTHFLOW_KEY == "") {
+    stop("SYNTHFLOW_KEY vacio. Define Sys.getenv('SYNTHFLOW_KEY')")
+  }
+
+  params <- list(model_id = model_id, limit = as.character(limit))
+  if (!is.null(from_date)) params$from_date <- as.character(round(from_date))
+  if (!is.null(to_date))   params$to_date   <- as.character(round(to_date))
+
+  last_err <- NULL
+
+  for (attempt in seq_len(retries)) {
+    r <- tryCatch(
+      GET(
+        url = SYNTHFLOW_URL,
+        add_headers(
+          Authorization = paste("Bearer", SYNTHFLOW_KEY),
+          Accept = "application/json"
+        ),
+        query = params,
+        timeout(timeout_sec)
+      ),
+      error = function(e) { last_err <<- e; NULL }
+    )
+
+    # si ni siquiera hubo respuesta (timeout / network)
+    if (is.null(r)) {
+      Sys.sleep(min(20, backoff_base^(attempt - 1)))
+      next
+    }
+
+    # códigos recuperables (rate limit / server)
+    sc <- status_code(r)
+    if (sc %in% c(429, 500, 502, 503, 504)) {
+      Sys.sleep(min(20, backoff_base^(attempt - 1)))
+      next
+    }
+
+    # errores no recuperables
+    if (sc != 200) {
+      stop(paste0(
+        "ERROR Synthflow ", sc, ": ",
+        content(r, "text", encoding = "UTF-8")
+      ))
+    }
+
+    body_txt <- content(r, "text", encoding = "UTF-8")
+    body <- fromJSON(body_txt, simplifyVector = TRUE)
+    calls <- body$response$calls
+    return(normalize_calls(calls))
+  }
+
+  stop(paste0(
+    "Timeout/Network: no pude obtener pagina para model_id=", model_id,
+    " luego de ", retries, " intentos. Ultimo error: ",
+    if (!is.null(last_err)) conditionMessage(last_err) else "desconocido"
+  ))
+}
+
+
+
+drain_calls_desc <- function(model_id, from_date = NULL, to_date = NULL, max_pages = 3000, limit = LIMIT) {
+
+  all_calls <- list()
+
+  cursor_to <- to_date
+
+  pages <- 0
+
+  while (pages < max_pages) {
+
+    calls <- fetch_calls_page(
+      model_id,
+      from_date = from_date,
+      to_date = cursor_to,
+      limit = limit
+    )
+
+    if (length(calls) == 0) break
+
+    all_calls <- c(all_calls, calls)
+
+    times <- suppressWarnings(
+      map_dbl(calls, ~ as.numeric(.x[["start_time"]] %||% NA_real_))
+    )
+
+    times <- times[!is.na(times)]
+
+    if (length(times) == 0) break
+
+    min_batch <- min(times)
+
+    next_to <- min_batch - 1
+
+    if (!is.null(from_date) && next_to < from_date) break
+
+    if (!is.null(cursor_to) && next_to >= cursor_to) break
+
+    cursor_to <- next_to
+
+    pages <- pages + 1
+  }
+
+  all_calls
+
+}
+
+
+calls_to_df <- function(calls) {
+
+  calls <- normalize_calls(calls)
+
+  if (length(calls) == 0) return(tibble())
+
+  tibble(calls = calls) |>
+    tidyr::unnest_wider(calls) |>
+    mutate(start_time = suppressWarnings(as.numeric(start_time)))
+
+}
+
+
+
+get_calls_df <- function(
+  model_id,
+  from_date = NULL,
+  to_date = NULL,
+  last_hours = NULL,
+  last_days = NULL,
+  limit_per_page = LIMIT,
+  max_pages = 2000,
+  tz = "America/Guatemala"
+) {
+
+  if (!is.null(last_hours)) {
+
+    to_ms <- now_ms()
+
+    from_ms <- to_ms - as.numeric(last_hours) * 60 * 60 * 1000
+
+  } else if (!is.null(last_days)) {
+
+    to_ms <- now_ms()
+
+    from_ms <- to_ms - as.numeric(last_days) * 24 * 60 * 60 * 1000
+
+  } else {
+
+    from_ms <- if (is.character(from_date)) parse_to_ms(from_date, tz) else from_date
+
+    to_ms <- if (is.character(to_date)) parse_to_ms(to_date, tz) else to_date
+
+  }
+
+  calls <- drain_calls_desc(
+    model_id = model_id,
+    from_date = from_ms,
+    to_date = to_ms,
+    max_pages = max_pages,
+    limit = limit_per_page
+  )
+
+  calls_to_df(calls)
+
+}
+
+
+
+df <- map_dfr(
+  MODEL_IDS,
+  function(mid) {
+
+    get_calls_df(
+      model_id = mid,
+      from_date = from_date,
+      to_date = to_date,
+      limit_per_page = 100,
+      max_pages = 500
+    ) %>%
+      mutate(model_id = mid)
+
+  }
+)
+
+
+
+df <- df %>%
+  mutate(
+    Estado = case_when(
+      call_status == "completed" ~ "Contestada",
+      call_status == "no-answer" ~ "No contestada",
+      call_status == "failed" ~ "Fallida",
+      call_status == "hangup_on_voicemail" ~ "Buzon",
+      TRUE ~ "Otro"
+    ),
+
+    Bot = case_when(
+      model_id == "1a5677fe-dd82-4420-b2d2-feadbe0315ce" ~ "Inbound Assistant",
+      model_id == "bb9184fe-2ffa-4e42-b7aa-fafc6a7f92c5" ~ "Victor Honduras",
+      model_id == "a896eb65-9e44-4b64-80a7-05caaa3933c7" ~ "Victor Salvador",
+      model_id == "95293754-e482-47a9-adc2-dfde86032abe" ~ "Victor Guatemala"
+    ),
+
+    Fecha = as.POSIXct(
+      start_time / 1000,
+      origin = "1970-01-01",
+      tz = "America/Guatemala"
+    )
+  )
+
+
+
+df <- df %>%
+  mutate(duration = as.numeric(duration)) %>%
+  select(
+    Bot,
+    call_id,
+    Fecha,
+    duration,
+    Estado
+  )
+
+
+
+df2 <- df %>%
+  mutate(duration = as.numeric(duration)) %>%
+  group_by(Bot) %>%
+  summarise(
+    'Llamadas' = n(),
+    Completadas = sum(Estado == "Contestada", na.rm = TRUE),
+    'No Contestadas' = sum(Estado == "No contestada", na.rm = TRUE),
+    Fallidas = sum(Estado == "Fallida", na.rm = TRUE),
+    'Buzon de Voz' = sum(Estado == "Buzon", na.rm = TRUE),
+    Minutos = sum(duration / 60, na.rm = TRUE)
+  )
+```
+
+\begin{minipage}{0.48\textwidth}
+\textbf{Cliente:} Oi Latam  
+
+\textbf{Fecha Inicio:} `r from_date`  
+
+\textbf{Fecha Fin:} `r to_date`
+\end{minipage}
+\hfill
+\begin{minipage}{0.48\textwidth}
+\raggedleft
+\textbf{Total Llamadas:} `r sum(df2$Llamadas)`  
+
+\textbf{Total Minutos:} `r format(round(sum(df2$Minutos),1), scientific=FALSE)`  
+
+\textbf{Tasa de Contacto:} `r round(sum(df$Estado == "Contestada") / nrow(df) * 100, 1)`%
+\end{minipage}
+
+
+
+
+***Distribución de número de Llamadas por BOT***
+```{r,echo=FALSE,warning=FALSE,message=FALSE}
+kbl(df2, booktabs = TRUE,longtable=TRUE, linesep = "") %>%
+  kable_styling(
+    latex_options = c("scale_down", "repeat_header"), 
+    font_size = 9
+  ) %>%
+  column_spec(1, width = "0.9in") %>%
+  column_spec(2, width = "0.9in") %>%
+  column_spec(3, width = "0.9in") %>%
+  column_spec(4, width = "0.9in") %>%
+  column_spec(5, width = "0.9in") %>%
+  column_spec(6, width = "0.9in") %>%
+  column_spec(7, width = "0.9in") %>%
+  row_spec(0, background = "#008FFF", color = "black", bold = TRUE, font_size = 10)
+```
+
+***Distribución de consumo de minutos por BOT***
+```{r,echo=FALSE,warning=FALSE,message=FALSE}
+
+df3 <- df %>%
+  mutate(duration = as.numeric(duration)) %>%
+  group_by(Bot) %>%
+  summarise(
+    'Total Llamadas'= n(),
+    Completadas = round(sum(ifelse(Estado == "Contestada", duration/60, 0), na.rm = TRUE), 1),
+    'No Contestadas' = round(sum(ifelse(Estado == "No contestada", duration/60, 0), na.rm = TRUE), 1),
+    Fallidas = round(sum(ifelse(Estado == "Fallida", duration/60, 0), na.rm = TRUE), 1),
+    'Buzon de Voz' = round(sum(ifelse(Estado == "Buzon", duration/60, 0), na.rm = TRUE), 1),
+    Minutos = round(sum(duration / 60, na.rm = TRUE), 1)
+  )
+
+kbl(df3, booktabs = TRUE,longtable=TRUE, linesep = "") %>%
+  kable_styling(
+    latex_options = c("scale_down", "repeat_header"), 
+    font_size = 9
+  ) %>%
+  column_spec(1, width = "0.9in") %>%
+  column_spec(2, width = "0.9in") %>%
+  column_spec(3, width = "0.9in") %>%
+  column_spec(4, width = "0.9in") %>%
+  column_spec(5, width = "0.9in") %>%
+  column_spec(6, width = "0.9in") %>%
+  column_spec(7, width = "0.9in") %>%
+  row_spec(0, background = "#008FFF", color = "black", bold = TRUE, font_size = 10)
+
+#kableExtra::kable(df3,caption="Consumo de minutos por Bot",booktabs = FALSE)%>%
+  #kableExtra::row_spec(0, background = "cyan", color = "black")
+#df <- df %>%
+  #mutate(duration = as.numeric(duration))
+```
+
+
+```{r fig.show='hold', out.width="50%",message=FALSE,warning=FALSE,echo=FALSE}
+hist(
+  df$duration[df$Estado == "Buzon"],
+  breaks = 30,
+  col = "steelblue",
+  main = "Consumo llamadas a Buzon de voz",
+  xlab = "Consumo segundos",
+  ylab= "Cantidad de llamadas"
+)
+
+hist(
+  df$duration[df$Estado == "Fallida"],
+  breaks = 10,
+  col = "steelblue",
+  main = "Consumo llamadas Fallidas",
+  xlab = "Consumo segundos",
+  ylab= "Cantidad de llamadas"
+)
+```
+
+**Duración Prom.(min) - Buzón :** `r round(mean(ifelse(df$Estado == "Buzon", df$duration/60, NA), na.rm = TRUE), 1) `
+
+**Duración Prom.(min) - Fallida :** `r round(mean(ifelse(df$Estado == "Fallida", df$duration/60, NA), na.rm = TRUE), 3) `
+
+```{r fig.show='hold', out.width="50%",message=FALSE,warning=FALSE,echo=FALSE}
+hist(
+  df$duration[df$Estado == "Contestada"],
+  breaks = 30,
+  col = "steelblue",
+  main = "Consumo llamadas Contestadas",
+  xlab = "Consumo segundos",
+  ylab= "Cantidad de llamadas"
+)
+
+```
+
+**Duración Prom.(min) - Contestada :** `r round(mean(ifelse(df$Estado == "Contestada", df$duration/60, NA), na.rm = TRUE), 1) `
+
+**Lista de Llamadas**
+
+```{r,echo=FALSE,warning=FALSE,message=FALSE}
+kbl(df, booktabs = TRUE,longtable=TRUE, linesep = "") %>%
+  kable_styling(
+    latex_options = c("scale_down", "repeat_header"), 
+    font_size = 9
+  ) %>%
+  column_spec(1, width = "1.3in") %>%
+  column_spec(2, width = "2.3in") %>%
+  column_spec(3, width = "0.9in") %>%
+  column_spec(4, width = "0.9in") %>%
+  column_spec(5, width = "0.9in") %>%
+  row_spec(0, background = "#008FFF", color = "black", bold = TRUE, font_size = 10)
+```
+
+
